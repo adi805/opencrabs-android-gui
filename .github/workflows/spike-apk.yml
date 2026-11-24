@@ -11,6 +11,7 @@ jobs:
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      BUILD_TOOLS: /usr/local/lib/android/sdk/build-tools/36.0.0
     steps:
       - uses: actions/checkout@v4
 
@@ -32,12 +33,40 @@ jobs:
           cargo apk build -p oc-gui --lib
           find target/debug/apk -name '*.apk' -print -exec ls -l {} \;
 
+      # cargo-apk emits BOTH oc-gui.apk (signed) and oc-gui-unaligned.apk
+      # (unsigned intermediate). Shipping the unsigned one makes Android say
+      # "package appears to be invalid", so this gate is hard: it fails the
+      # job and the artifact is never uploaded.
+      - name: Gate - APK must be signed, aligned and 16K-page safe
+        run: |
+          set -euo pipefail
+          APK="$(find target/debug/apk -maxdepth 2 -name '*.apk' ! -name '*-unaligned.apk' | head -1)"
+          [ -n "$APK" ] || { echo "FAIL: no signed apk produced"; exit 1; }
+          echo "candidate: $APK"
+          echo "--- apksigner verify ---"
+          "${BUILD_TOOLS}/apksigner" verify --verbose --print-certs "$APK"
+          echo "--- zipalign 16K page check ---"
+          "${BUILD_TOOLS}/zipalign" -c -v -p 16 "$APK"
+          echo "--- ELF LOAD alignment (must be 0x4000) ---"
+          mkdir -p /tmp/elfchk && unzip -o -q "$APK" 'lib/*/*.so' -d /tmp/elfchk
+          for so in $(find /tmp/elfchk -name '*.so'); do
+            readelf -lW "$so" | awk '/LOAD/ {print $NF}' | sort -u | tee /tmp/align.txt
+            grep -qx '0x4000' /tmp/align.txt || { echo "FAIL: $so LOAD align not 0x4000"; exit 1; }
+          done
+          echo "SIGNED_APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Stage verified APK as the only artifact
+        run: |
+          mkdir -p out
+          cp "$SIGNED_APK" out/oc-gui-signed.apk
+          sha256sum out/oc-gui-signed.apk | tee out/SHA256SUMS.txt
+          ls -l out/
+
       - name: Verify badging
         run: |
-          APK=$(find target/debug/apk -name '*.apk' | head -1)
-          ${ANDROID_HOME}/build-tools/36.0.0/aapt2 dump badging "$APK" | grep -E "package:|sdkVersion|native-code"
+          "${BUILD_TOOLS}/aapt2" dump badging out/oc-gui-signed.apk | grep -E "package:|sdkVersion|native-code"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: oc-gui-spike-apk
-          path: target/debug/apk/**/*.apk
+          name: oc-gui-signed-apk
+          path: out/
