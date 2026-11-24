@@ -16,7 +16,8 @@ jobs:
 
       - name: Install SDK components
         run: |
-          sudo sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35" > sdk.log 2>&1 || sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
