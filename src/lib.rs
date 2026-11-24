@@ -1,5 +1,5 @@
-# Spike: keyboard + rendering check for a full-Rust egui app on Android.
-# GO/NO-GO gate for the OpenCrabs Android GUI (see opencrabs-android/files/DECISIONS.md).
+// Spike: keyboard + rendering check for a full-Rust egui app on Android.
+// GO/NO-GO gate for the OpenCrabs Android GUI (see opencrabs-android/files/DECISIONS.md).
 
 use eframe::egui;
 
