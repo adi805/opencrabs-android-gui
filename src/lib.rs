@@ -1,167 +1,239 @@
-// Spike: keyboard + rendering check for a full-Rust egui app on Android.
-// GO/NO-GO gate for the OpenCrabs Android GUI (see opencrabs-android/files/DECISIONS.md).
+// Spike v5: GameActivity IME bridge proof for the OpenCrabs Android GUI.
 //
-// Fix round 3 (self-healing + CI-drivable test):
-// - Auto-focus the text field on the first frame so the keyboard opens
-//   without any tap at all.
-// - show_soft_input is re-requested EVERY frame while focused. The old
-//   kb_shown cache could desync from the real Android IME state and then
-//   never retry, which looked like "keyboard never appears".
-// - The app logs its own TextField geometry (PXCX/PXCY = physical px center)
-//   and typed-char count to logcat, so CI can drive the emulator test with
-//   exact coordinates instead of guessing from a screenshot.
+// Root cause of the previous "-100" build, verified against upstream source
+// (not guessed, file:line included):
+//
+//   1. android-activity 0.6 `native_activity` implements `text_input_state()`
+//      as "always return an empty state" and `set_text_input_state()` as an
+//      explicit NOP
+//      (android-activity-0.6.0/src/native_activity/mod.rs:381 and :390).
+//      The old spike could therefore never receive typed characters, no matter
+//      what the Java layer did.
+//
+//   2. winit 0.30's Android backend only maps `InputEvent::MotionEvent` and
+//      `InputEvent::KeyEvent`
+//      (winit-0.30.0/src/platform_impl/android/mod.rs:378 and :427).
+//      `InputEvent::TextEvent` is never forwarded, so egui never sees an IME
+//      commit on native_activity.
+//
+//   3. `game_activity` has a real bridge. AGDK's Java GameActivity implements
+//      `stateChanged(State, boolean)` and forwards it to
+//      `onTextInputEventNative(...)`, which lands in
+//      `GameTextInput::processEvent` and updates the native state returned by
+//      `GameActivity_getTextInputState()`
+//      (android-activity-0.6.0/game-activity-csrc/game-text-input/gametextinput.cpp:280).
+//
+// So this spike polls `AndroidApp::text_input_state()` once per frame and
+// adopts whatever the IME committed into the egui TextEdit buffer.
+//
+// Push-back (`set_text_input_state`) is used ONLY for programmatic edits:
+// AGDK's `InputConnection.setState()` clears the editable and re-inserts the
+// whole text, so pushing it every frame would wipe characters the IME just
+// committed.
 
 use eframe::egui;
 
 #[cfg(target_os = "android")]
+use std::time::Duration;
+
+#[cfg(target_os = "android")]
+use winit::platform::android::activity::{input::TextInputState, input::TextSpan, AndroidApp};
+
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-fn android_main(app: winit::platform::android::activity::AndroidApp) {
+fn android_main(app: AndroidApp) {
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("OcGui"),
     );
+    log::info!("APP_START glue=game-activity");
 
     let options = eframe::NativeOptions {
         android_app: Some(app.clone()),
         ..Default::default()
     };
+
     eframe::run_native(
         "OpenCrabs GUI",
         options,
-        Box::new(move |_cc| Ok(Box::new(Spike::new(app)))),
+        Box::new(|_cc| Ok(Box::new(Spike::new(app)))),
     )
-    .unwrap();
+    .expect("eframe::run_native failed");
 }
 
+#[cfg(target_os = "android")]
 struct Spike {
+    app: AndroidApp,
+    /// Buffer owned by the egui TextEdit.
     typed: String,
-    focused_once: bool,
-    #[cfg(target_os = "android")]
-    last_px: (f32, f32),
-    #[cfg(target_os = "android")]
+    /// Last text the IME reported through `text_input_state()`.
+    ime_text: String,
+    /// Text we asked the IME to adopt; while pending we must not adopt the
+    /// stale IME state back, otherwise a programmatic edit gets undone.
+    pending_push: Option<String>,
+    focus_requested: bool,
+    last_focus: Option<bool>,
+    ime_calls: u32,
+    next_ime_at: f64,
+    frame: u64,
+    last_px: (i32, i32),
     last_chars: usize,
-    #[cfg(target_os = "android")]
-    app: winit::platform::android::activity::AndroidApp,
+    last_ime_chars: usize,
 }
 
-// Desktop entrypoint never runs in the Android build; the AndroidApp field is
-// cfg'd out there, so Default only needs the plain fields.
-#[cfg(not(target_os = "android"))]
-impl Default for Spike {
-    fn default() -> Self {
-        Self {
-            typed: String::new(),
-            focused_once: false,
-        }
-    }
-}
-
+#[cfg(target_os = "android")]
 impl Spike {
-    #[cfg(target_os = "android")]
-    fn new(app: winit::platform::android::activity::AndroidApp) -> Self {
+    fn new(app: AndroidApp) -> Self {
         Self {
-            typed: String::new(),
-            focused_once: false,
-            last_px: (0.0, 0.0),
-            last_chars: 0,
             app,
+            typed: String::new(),
+            ime_text: String::new(),
+            pending_push: None,
+            focus_requested: false,
+            last_focus: None,
+            ime_calls: 0,
+            next_ime_at: 0.0,
+            frame: 0,
+            last_px: (-1, -1),
+            last_chars: usize::MAX,
+            last_ime_chars: usize::MAX,
         }
+    }
+
+    /// Push a full replacement of the IME buffer (used by the Clear button).
+    fn push_text(&mut self, text: &str) {
+        let len = text.len();
+        self.app.set_text_input_state(TextInputState {
+            text: text.to_string(),
+            selection: TextSpan {
+                start: len,
+                end: len,
+            },
+            compose_region: None,
+        });
+        self.pending_push = Some(text.to_string());
+        log::info!("IME_PUSH chars={} text={:?}", text.chars().count(), text);
     }
 }
 
+#[cfg(target_os = "android")]
 impl eframe::App for Spike {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Keep content clear of the Android status bar.
-        egui::Panel::top("status_bar_space").show(ui, |ui| {
-            ui.set_height(32.0);
-        });
+        self.frame += 1;
+        let now = ui.input(|i| i.time);
 
-        #[cfg(target_os = "android")]
-        {
-            // Adopt whatever the IME committed since the last frame.
-            let ime_text = self.app.text_input_state().text;
-            if ime_text != self.typed {
-                self.typed = ime_text;
+        // 1. Read the IME state FIRST. AGDK's InputConnection.setState()
+        //    replaces the whole editable, so we must never push before we know
+        //    what the IME currently holds.
+        let ts = self.app.text_input_state();
+        let ime_chars = ts.text.chars().count();
+        if ime_chars != self.last_ime_chars || ts.text != self.ime_text {
+            log::info!(
+                "IME_TEXT chars={} text={:?} sel={}..{}",
+                ime_chars,
+                ts.text,
+                ts.selection.start,
+                ts.selection.end
+            );
+            self.last_ime_chars = ime_chars;
+        }
+        self.ime_text = ts.text.clone();
+
+        // 2. Adopt what the IME committed, unless we are waiting for our own
+        //    push-back to land.
+        match &self.pending_push {
+            Some(expected) if *expected == self.ime_text => {
+                self.pending_push = None;
+            }
+            Some(_) => {}
+            None => {
+                if self.ime_text != self.typed {
+                    log::info!(
+                        "IME_ADOPT chars={} text={:?}",
+                        self.ime_text.chars().count(),
+                        self.ime_text
+                    );
+                    self.typed = self.ime_text.clone();
+                }
             }
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("OpenCrabs GUI spike");
+            ui.heading("OpenCrabs GUI spike v5 (game-activity)");
             ui.separator();
-            ui.label("GO test: field auto-focuses, keyboard opens, type, text appears.");
-            let response = egui::TextEdit::singleline(&mut self.typed)
-                .hint_text("ketik di sini")
-                .show(ui);
 
-            if !self.focused_once {
-                response.response.request_focus();
-                self.focused_once = true;
+            let out = egui::TextEdit::multiline(&mut self.typed)
+                .hint_text("ketik di sini")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            let focused = out.response.has_focus();
+
+            if !self.focus_requested {
+                out.response.request_focus();
+                self.focus_requested = true;
+            }
+
+            if self.last_focus != Some(focused) {
+                log::info!("FOCUS {}", focused);
+                self.last_focus = Some(focused);
+            }
+
+            // AGDK's setSoftKeyboardActive(true) calls restartInput(), so the
+            // IME must be requested on an edge (and retried a few times), never
+            // every frame.
+            if focused && (self.ime_calls == 0 || (self.ime_calls < 6 && now >= self.next_ime_at))
+            {
+                self.app.show_soft_input(true);
+                self.ime_calls += 1;
+                self.next_ime_at = now + 1.5;
+                log::info!("IME_REQUEST n={}", self.ime_calls);
             }
 
             ui.add_space(8.0);
-            ui.monospace(format!("echo: {}", self.typed));
-            ui.separator();
+            ui.label(format!("ime buffer: {:?}", self.ime_text));
+            ui.label(format!("focused: {}", focused));
             let chars = self.typed.chars().count();
-            ui.label(format!("frames ok, chars typed: {}", chars));
+            ui.label(format!("typed: {} '{}'", chars, self.typed));
 
-            // CI hook: log the field's physical-pixel center so the emulator
-            // job can tap it precisely. Only when geometry changes, so logcat
-            // stays quiet after the first layout pass.
+            if ui.button("Clear").clicked() {
+                self.typed.clear();
+                self.push_text("");
+            }
+
+            // CI evidence hooks.
             let ppp = ui.ctx().pixels_per_point();
-            let r = response.response.rect;
-            let px = ((r.center().x * ppp).round(), (r.center().y * ppp).round());
-            if (px.0 - self.last_px.0).abs() > 0.5 || (px.1 - self.last_px.1).abs() > 0.5 {
+            let rect = out.response.rect;
+            let px = (
+                (rect.center().x * ppp).round() as i32,
+                (rect.center().y * ppp).round() as i32,
+            );
+            if px != self.last_px {
                 log::info!(
-                    "TEXTFIELD ppp={:.3} rect=({:.1},{:.1})-({:.1},{:.1}) PXCX={} PXCY={}",
-                    ppp,
-                    r.left(),
-                    r.top(),
-                    r.right(),
-                    r.bottom(),
+                    "TEXTFIELD pxcx={} pxcy={} w={} h={} ppp={}",
                     px.0,
-                    px.1
+                    px.1,
+                    (rect.width() * ppp).round() as i32,
+                    (rect.height() * ppp).round() as i32,
+                    ppp
                 );
                 self.last_px = px;
             }
             if chars != self.last_chars {
-                log::info!("TYPED chars={}", chars);
+                log::info!("TYPED chars={} text={:?}", chars, self.typed);
                 self.last_chars = chars;
             }
-
-            #[cfg(target_os = "android")]
-            {
-                // Manual controls for on-device isolation testing.
-                ui.horizontal(|ui| {
-                    if ui.button("Show keyboard").clicked() {
-                        self.app.show_soft_input(true);
-                    }
-                    if ui.button("Hide keyboard").clicked() {
-                        self.app.hide_soft_input(false);
-                    }
-                });
-
-                let focused = response.response.has_focus();
-                // Self-healing: re-request the IME every frame while focused.
-                // Idempotent on Android and immune to state desync.
-                if focused {
-                    self.app.show_soft_input(true);
-                } else {
-                    self.app.hide_soft_input(false);
-                }
-
-                // Keep the IME buffer identical to ours so composition and
-                // the cursor land in the right place.
-                let len = self.typed.len();
-                self.app.set_text_input_state(
-                    winit::platform::android::activity::input::TextInputState {
-                        text: self.typed.clone(),
-                        selection: winit::platform::android::activity::input::TextSpan {
-                            start: len,
-                            end: len,
-                        },
-                        compose_region: None,
-                    },
+            if self.frame == 1 {
+                log::info!(
+                    "APP_READY ppp={} screen={:?}",
+                    ppp,
+                    ui.ctx().screen_rect()
                 );
             }
         });
+
+        // Keep polling the IME even when nothing else happens.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 }

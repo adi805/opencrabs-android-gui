@@ -2,32 +2,31 @@
 name = "oc-gui"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
 publish = false
 
 [lib]
-# cdylib is required for Android, lib is required for desktop
+# cdylib is what GameActivity dlopen()s; the lib target keeps rust-analyzer sane.
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+# glow (OpenGL ES) rather than wgpu: the CI emulator renders with swiftshader,
+# which exposes GLES reliably and Vulkan only partially.
 eframe = { version = "0.36", default-features = false, features = [
   "default_fonts",
   "glow",
-  "android-native-activity",
+  "android-game-activity",
 ] }
 android_logger = "0.15"
 log = "0.4"
-winit = "0.30"
+# The android-game-activity feature is what switches android-activity from the
+# native_activity glue (text_input_state = NOP) to the GameActivity glue
+# (real GameTextInput bridge). Keep it on our own dependency too so feature
+# unification cannot silently drop it.
+winit = { version = "0.30", default-features = false, features = [
+  "android-game-activity",
+] }
 
-[package.metadata.android]
-package = "io.opencrabs.mobile.gui"
-build_targets = ["aarch64-linux-android"]
-
-[package.metadata.android.sdk]
-min_sdk_version = 26
-target_sdk_version = 35
-
-# Spike APK is debug-signed (no release keystore in CI), so keep the dev profile
-# but strip symbols: unstripped the .so is 141 MB and will not upload to chat.
+# Debug APK: strip symbols so the per-ABI .so stays well under the 50 MB
+# Telegram bot upload limit (unstripped debug cdylib is ~141 MB).
 [profile.dev]
 strip = "symbols"

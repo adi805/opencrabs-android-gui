@@ -3,159 +3,189 @@ name: spike-apk
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
-  apk:
+  build-apk:
+    name: APK arm64 (GameActivity + Gradle)
     runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
-      BUILD_TOOLS: /usr/local/lib/android/sdk/build-tools/36.0.0
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install SDK components
-        run: |
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-          sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
-      - name: Install cargo-apk (patched rev, per egui hello_android README)
-        run: cargo install --git https://github.com/parasyte/cargo-apk.git --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
-      - name: Build APK (debug-signed, symbols stripped)
-        run: |
-          export PATH="${ANDROID_NDK_ROOT}:$PATH"
-          cargo apk build -p oc-gui --lib
-          find target/debug/apk -name '*.apk' -print -exec ls -l {} \;
-
-      # cargo-apk emits BOTH oc-gui.apk (signed) and oc-gui-unaligned.apk
-      # (unsigned intermediate). Shipping the unsigned one makes Android say
-      # "package appears to be invalid", so this gate is hard: it fails the
-      # job and the artifact is never uploaded.
-      - name: Gate - APK must be signed, aligned and 16K-page safe
-        run: |
-          set -euo pipefail
-          APK="$(find target/debug/apk -maxdepth 2 -name '*.apk' ! -name '*-unaligned.apk' | head -1)"
-          [ -n "$APK" ] || { echo "FAIL: no signed apk produced"; exit 1; }
-          echo "candidate: $APK"
-          echo "--- apksigner verify ---"
-          "${BUILD_TOOLS}/apksigner" verify --verbose --print-certs "$APK"
-          echo "--- zipalign 16K page check ---"
-          "${BUILD_TOOLS}/zipalign" -c -v -p 16 "$APK"
-          echo "--- ELF LOAD alignment (must be 0x4000) ---"
-          mkdir -p /tmp/elfchk && unzip -o -q "$APK" 'lib/*/*.so' -d /tmp/elfchk
-          for so in $(find /tmp/elfchk -name '*.so'); do
-            readelf -lW "$so" | awk '/LOAD/ {print $NF}' | sort -u | tee /tmp/align.txt
-            grep -qx '0x4000' /tmp/align.txt || { echo "FAIL: $so LOAD align not 0x4000"; exit 1; }
-          done
-          echo "SIGNED_APK=$APK" >> "$GITHUB_ENV"
-
-      - name: Stage verified APK as the only artifact
-        run: |
-          mkdir -p out
-          cp "$SIGNED_APK" out/oc-gui-signed.apk
-          sha256sum out/oc-gui-signed.apk | tee out/SHA256SUMS.txt
-          ls -l out/
-
-      - name: Verify badging
-        run: |
-          "${BUILD_TOOLS}/aapt2" dump badging out/oc-gui-signed.apk | grep -E "package:|sdkVersion|native-code"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-java@v4
         with:
-          name: oc-gui-signed-apk
-          path: out/
+          distribution: temurin
+          java-version: '21'
 
-  # Owner mandate: the agent tests the app itself on an emulator BEFORE the
-  # human ever installs anything. No tap-guessing: the app logs its own
-  # TextField center (PXCX/PXCY), CI taps exactly there, then asserts the
-  # keyboard is shown and typed text reached the field (TYPED chars>0).
-  emulator-test:
-    needs: apk
+      - name: Install Android SDK bits
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build .so (aarch64)
+        run: |
+          cargo ndk -t arm64 -o app/src/main/jniLibs build --lib
+          ls -la app/src/main/jniLibs/arm64-v8a/
+          file app/src/main/jniLibs/arm64-v8a/*.so
+
+      - name: Gradle assembleDebug
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: "Gate: apksigner + zipalign + ELF"
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          BT=$ANDROID_HOME/build-tools/36.0.0
+          ls -la "$APK"
+          "$BT/zipalign" -c -p 16 "$APK"
+          "$BT/apksigner" verify --print-certs "$APK"
+          unzip -o "$APK" 'lib/*' -d /tmp/apk-check >/dev/null
+          file /tmp/apk-check/lib/arm64-v8a/*.so | grep -q 'aarch64' || { echo 'wrong ELF arch'; exit 1; }
+          readelf -lW /tmp/apk-check/lib/arm64-v8a/*.so | grep -q '0x4000' || { echo 'ELF LOAD alignment must be 0x4000 (16KB page)'; exit 1; }
+
+      - name: "Gate: aapt2 badging"
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          BT=$ANDROID_HOME/build-tools/36.0.0
+          "$BT/aapt2" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "package: name='io.opencrabs.mobile.gui'" /tmp/badging.txt
+          grep -q "sdkVersion:'26'" /tmp/badging.txt
+          grep -q "native-code: 'arm64-v8a'" /tmp/badging.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-gui-debug-apk-arm64
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  emulator-selftest:
+    name: Emulator self-test (keyboard + typed text)
     runs-on: ubuntu-latest
+    needs: build-apk
     env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      # Escape hatch of the emulator binary itself: if the runner has no KVM,
+      # boot falls back to TCG software emulation instead of hard-failing
+      # (error seen on run 45411777387). Ignored when KVM is present.
+      ANDROID_I_WANT_MY_TCG: "yes"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install SDK components
-        run: |
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-          sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-linux-android
 
-      - name: Install cargo-apk (patched rev)
-        run: cargo install --git https://github.com/parasyte/cargo-apk.git --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
-      - name: Build x86_64 APK for the emulator
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK bits
         run: |
-          export PATH="${ANDROID_NDK_ROOT}:$PATH"
-          cargo apk build -p oc-gui --lib --target x86_64-linux-android
-          find target/debug/apk -name '*.apk' ! -name '*-unaligned.apk' -print -exec ls -l {} \;
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
-      - name: Boot emulator, install, tap field, type, assert
+      - name: Build .so (x86_64, for emulator)
+        run: |
+          cargo ndk -t x86_64 -o app/src/main/jniLibs build --lib
+          file app/src/main/jniLibs/x86_64/*.so
+
+      - name: Gradle assembleDebug (x86_64 APK)
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Boot emulator (api-34 x86_64, KVM)
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
           arch: x86_64
           target: google_apis
+          emulator-boot-timeout: 900
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          disable-spellchecker: true
           script: |
-            set -x
-            APK="$(find target/debug/apk -name '*.apk' ! -name '*-unaligned.apk' | head -1)"
+            APK=app/build/outputs/apk/debug/app-debug.apk
+            ls -la "$APK"
+
             adb install -r "$APK"
             adb logcat -c
-            adb shell am start -W -n io.opencrabs.mobile.gui/android.app.NativeActivity
+            adb shell am start -W -n io.opencrabs.mobile.gui/.MainActivity
 
-            # Wait for the app to log its own TextField geometry.
-            LINE=""
-            for i in $(seq 1 30); do
-              LINE="$(adb logcat -d | grep -m1 'TEXTFIELD' || true)"
-              [ -n "$LINE" ] && break
-              sleep 2
+            # 1. App ready + textfield coords
+            TAPP=0
+            until adb logcat -d -s OcGui | grep -q TEXTFIELD; do
+              TAPP=$((TAPP+5))
+              if [ "$TAPP" -ge 120 ]; then
+                echo "--- boot timeout, last OcGui log ---"
+                adb logcat -d -s OcGui | tail -40
+                adb shell screencap -p /sdcard/fail-boot.png && adb pull /sdcard/fail-boot.png
+                exit 1
+              fi
+              sleep 5
             done
-            echo "layout line: $LINE"
-            [ -n "$LINE" ] || { echo "FAIL: app never logged TEXTFIELD geometry"; exit 1; }
+            adb logcat -d -s OcGui | grep -E 'APP_START|APP_READY|TEXTFIELD|FOCUS|IME' | tail -20
 
-            X="$(echo "$LINE" | grep -o 'PXCX=[0-9]*' | cut -d= -f2)"
-            Y="$(echo "$LINE" | grep -o 'PXCY=[0-9]*' | cut -d= -f2)"
-            [ -n "$X" ] && [ -n "$Y" ] || { echo "FAIL: could not parse tap coords from: $LINE"; exit 1; }
-            echo "tap target: $X,$Y"
-            adb shell input tap "$X" "$Y"
-            sleep 3
+            PXCX=$(adb logcat -d -s OcGui | grep TEXTFIELD | tail -1 | sed 's/.*pxcx=\([0-9]*\).*/\1/')
+            PXCY=$(adb logcat -d -s OcGui | grep TEXTFIELD | tail -1 | sed 's/.*pxcy=\([0-9]*\).*/\1/')
+            echo "tap target: $PXCX x $PXCY"
+            [ "$PXCX" -gt 0 ] && [ "$PXCY" -gt 0 ] || { echo 'invalid tap coords'; exit 1; }
 
-            adb shell dumpsys input_method | grep -q 'mInputShown=true' \
-              || { echo "FAIL: soft keyboard not shown after tap+autofocus"; adb screencap -p /sdcard/fail-kb.png; adb pull /sdcard/fail-kb.png; exit 1; }
-            echo "PASS: keyboard shown"
+            adb shell input tap "$PXCX" "$PXCY"
 
-            adb logcat -c
+            # 2. IME must actually show
+            TKB=0
+            until adb shell dumpsys input_method | grep -q 'mInputShown=true'; do
+              TKB=$((TKB+5))
+              if [ "$TKB" -ge 90 ]; then
+                echo "--- keyboard never showed ---"
+                adb logcat -d -s OcGui | tail -40
+                adb shell dumpsys input_method | grep -E 'mInputShown|mImeWindowVis|mInputViewShown' || true
+                adb shell screencap -p /sdcard/fail-kb.png && adb pull /sdcard/fail-kb.png
+                exit 1
+              fi
+              sleep 5
+            done
+            echo "KEYBOARD SHOWN"
+
+            # 3. Type via IME and require egui to receive it
             adb shell input text "halo123"
-            sleep 3
+            TTYPED=0
+            until adb logcat -d -s OcGui | grep -qE 'TYPED chars=[1-9]'; do
+              TTYPED=$((TTYPED+5))
+              if [ "$TTYPED" -ge 60 ]; then
+                echo "--- typed text never reached egui ---"
+                adb logcat -d -s OcGui | tail -40
+                adb shell screencap -p /sdcard/fail-typed.png && adb pull /sdcard/fail-typed.png
+                exit 1
+              fi
+              sleep 5
+            done
+            adb logcat -d -s OcGui | grep -E 'IME_TEXT|IME_ADOPT|TYPED' | tail -20
 
-            TYPED="$(adb logcat -d | grep -o 'TYPED chars=[0-9]*' | tail -1)"
-            echo "typed line: $TYPED"
-            echo "$TYPED" | grep -qE 'TYPED chars=[1-9][0-9]*' \
-              || { echo "FAIL: typed text never reached the field (IME bridge broken)"; adb screencap -p /sdcard/fail-type.png; adb pull /sdcard/fail-type.png; exit 1; }
-            echo "PASS: typed text reached egui"
+            adb shell screencap -p /sdcard/pass.png && adb pull /sdcard/pass.png
+            echo "SELFTEST PASS: keyboard shown + typed chars > 0"
 
-            mkdir -p "$GITHUB_WORKSPACE/shots"
-            adb exec-out screencap -p > "$GITHUB_WORKSPACE/shots/after-type.png"
-
-      - name: Upload test evidence
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-evidence
+          name: emulator-screens
           path: |
-            shots/
+            pass.png
             fail-*.png
-          if-no-files-found: ignore

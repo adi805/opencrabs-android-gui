@@ -1,0 +1,45 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.opencrabs.mobile.gui'
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "io.opencrabs.mobile.gui"
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 1
+        versionName = "0.1.0"
+    }
+
+    buildTypes {
+        debug {
+            // AGP creates and uses the default debug keystore; CI then verifies
+            // the signature with apksigner before anything is uploaded.
+            minifyEnabled = false
+        }
+        release {
+            minifyEnabled = false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    // GameActivity + GameTextInput in one artifact (AGDK 4.x).
+    implementation 'androidx.games:games-activity:4.4.0'
+}
