@@ -103,9 +103,23 @@ $ADB install -r "$APK" 2>&1 | tail -3 || fail "adb install app failed"
 say "installing ADBKeyboard IME"
 $ADB install -r "$ADBKEYBOARD_APK" 2>&1 | tail -3 || fail "adb install ADBKeyboard failed"
 
+# Run 45487962664 lesson: `ime enable` fired 2s after `install Success` and
+# failed with "Unknown input method" because the system had not finished
+# scanning the package yet (TCG emulator is heavily loaded; even `system`
+# showed an ANR during diagnostics). The IME must be polled in
+# `ime list -s` until it is REGISTERED, however long that takes.
+say "waiting for ADBKeyboard to register: $IME_ID"
+IME_SEEN=0
+for _ in $(seq 1 60); do
+  if $ADB shell ime list -s 2>/dev/null | grep -q "^${IME_ID}$"; then IME_SEEN=1; break; fi
+  sleep 10
+done
+[ "$IME_SEEN" = "1" ] || fail "ADBKeyboard never appeared in ime list -s"
 say "selecting IME: $IME_ID"
 $ADB shell ime enable "$IME_ID" 2>&1 | tail -1 || fail "ime enable failed"
 $ADB shell ime set "$IME_ID" 2>&1 | tail -1 || fail "ime set failed"
+$ADB shell dumpsys input_method 2>/dev/null | grep -o 'mCurMethodId=.*' | head -1
+$ADB shell dumpsys input_method 2>/dev/null | grep -q "mCurMethodId=${IME_ID}" || fail "ime set did not take effect"
 # The emulator ships a hardware keyboard; without this the soft IME window is
 # suppressed and mInputShown stays false for the wrong reason.
 $ADB shell settings put secure show_ime_with_hard_keyboard 1 2>&1 || true
