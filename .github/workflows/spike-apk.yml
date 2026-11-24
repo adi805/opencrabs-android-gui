@@ -85,6 +85,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A real IME for the self-test: adb's `input text` injects raw KeyEvents,
+      # which AGDK routes to onKeyDownNative/onKeyUpNative and NEVER into the
+      # text state, so it cannot exercise the IME bridge. ADBKeyboard
+      # (senzhk/ADBKeyBoard, MIT) commits text through InputConnection.commitText
+      # -- exactly the path a phone keyboard takes. Pinned + hash-checked.
+      - name: Fetch ADBKeyboard (pinned)
+        run: |
+          curl -sfL --retry 4 --retry-delay 4 -o ci/ADBKeyboard.apk \
+            "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.5-dev/keyboardservice-debug.apk"
+          echo '41a8a0996d7397a2390d1ca16a75cb66c4a7bdaa89cf4e63600a4d3fb346fbbb  ci/ADBKeyboard.apk' | sha256sum -c -
+          ls -la ci/ADBKeyboard.apk
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-linux-android
@@ -120,71 +132,15 @@ jobs:
           api-level: 34
           arch: x86_64
           target: google_apis
-          emulator-boot-timeout: 900
+          emulator-boot-timeout: 1200
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           disable-spellchecker: true
-          script: |
-            APK=app/build/outputs/apk/debug/app-debug.apk
-            ls -la "$APK"
-
-            adb install -r "$APK"
-            adb logcat -c
-            adb shell am start -W -n io.opencrabs.mobile.gui/.MainActivity
-
-            # 1. App ready + textfield coords
-            TAPP=0
-            until adb logcat -d -s OcGui | grep -q TEXTFIELD; do
-              TAPP=$((TAPP+5))
-              if [ "$TAPP" -ge 120 ]; then
-                echo "--- boot timeout, last OcGui log ---"
-                adb logcat -d -s OcGui | tail -40
-                adb shell screencap -p /sdcard/fail-boot.png && adb pull /sdcard/fail-boot.png
-                exit 1
-              fi
-              sleep 5
-            done
-            adb logcat -d -s OcGui | grep -E 'APP_START|APP_READY|TEXTFIELD|FOCUS|IME' | tail -20
-
-            PXCX=$(adb logcat -d -s OcGui | grep TEXTFIELD | tail -1 | sed 's/.*pxcx=\([0-9]*\).*/\1/')
-            PXCY=$(adb logcat -d -s OcGui | grep TEXTFIELD | tail -1 | sed 's/.*pxcy=\([0-9]*\).*/\1/')
-            echo "tap target: $PXCX x $PXCY"
-            [ "$PXCX" -gt 0 ] && [ "$PXCY" -gt 0 ] || { echo 'invalid tap coords'; exit 1; }
-
-            adb shell input tap "$PXCX" "$PXCY"
-
-            # 2. IME must actually show
-            TKB=0
-            until adb shell dumpsys input_method | grep -q 'mInputShown=true'; do
-              TKB=$((TKB+5))
-              if [ "$TKB" -ge 90 ]; then
-                echo "--- keyboard never showed ---"
-                adb logcat -d -s OcGui | tail -40
-                adb shell dumpsys input_method | grep -E 'mInputShown|mImeWindowVis|mInputViewShown' || true
-                adb shell screencap -p /sdcard/fail-kb.png && adb pull /sdcard/fail-kb.png
-                exit 1
-              fi
-              sleep 5
-            done
-            echo "KEYBOARD SHOWN"
-
-            # 3. Type via IME and require egui to receive it
-            adb shell input text "halo123"
-            TTYPED=0
-            until adb logcat -d -s OcGui | grep -qE 'TYPED chars=[1-9]'; do
-              TTYPED=$((TTYPED+5))
-              if [ "$TTYPED" -ge 60 ]; then
-                echo "--- typed text never reached egui ---"
-                adb logcat -d -s OcGui | tail -40
-                adb shell screencap -p /sdcard/fail-typed.png && adb pull /sdcard/fail-typed.png
-                exit 1
-              fi
-              sleep 5
-            done
-            adb logcat -d -s OcGui | grep -E 'IME_TEXT|IME_ADOPT|TYPED' | tail -20
-
-            adb shell screencap -p /sdcard/pass.png && adb pull /sdcard/pass.png
-            echo "SELFTEST PASS: keyboard shown + typed chars > 0"
+          # NOTE: this action executes its `script:` input line by line as
+          # separate `sh -c` processes (lib/script-parser.js +
+          # lib/main.js:212-215), so any multi-line logic dies here. All the
+          # real logic lives in ci/selftest.sh; keep this to ONE line.
+          script: bash ci/selftest.sh
 
       - name: Upload screenshots
         if: always()
@@ -193,4 +149,5 @@ jobs:
           name: emulator-screens
           path: |
             pass.png
+            keyboard-shown.png
             fail-*.png
