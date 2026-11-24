@@ -226,9 +226,10 @@ impl eframe::App for Spike {
             }
             if self.frame == 1 {
                 log::info!(
-                    "APP_READY ppp={} screen={:?}",
+                    "APP_READY ppp={} field={}x{}",
                     ppp,
-                    ui.ctx().screen_rect()
+                    (rect.width() * ppp).round() as i32,
+                    (rect.height() * ppp).round() as i32
                 );
             }
         });
