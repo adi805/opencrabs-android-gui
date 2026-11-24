@@ -27,9 +27,7 @@ build_targets = ["aarch64-linux-android"]
 min_sdk_version = 26
 target_sdk_version = 35
 
-# Release profile for the phone install: strip symbols so the APK fits a chat upload.
-[profile.release]
-opt-level = "s"
-lto = false
-codegen-units = 16
+# Spike APK is debug-signed (no release keystore in CI), so keep the dev profile
+# but strip symbols: unstripped the .so is 141 MB and will not upload to chat.
+[profile.dev]
 strip = "symbols"

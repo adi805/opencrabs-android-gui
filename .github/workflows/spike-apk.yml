@@ -26,18 +26,18 @@ jobs:
       - name: Install cargo-apk (patched rev, per egui hello_android README)
         run: cargo install --git https://github.com/parasyte/cargo-apk.git --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
 
-      - name: Build APK (release, stripped)
+      - name: Build APK (debug-signed, symbols stripped)
         run: |
           export PATH="${ANDROID_NDK_ROOT}:$PATH"
-          cargo apk build -p oc-gui --lib --release
-          find target/release/apk -name '*.apk' -print -exec ls -l {} \;
+          cargo apk build -p oc-gui --lib
+          find target/debug/apk -name '*.apk' -print -exec ls -l {} \;
 
       - name: Verify badging
         run: |
-          APK=$(find target/release/apk -name '*.apk' | head -1)
+          APK=$(find target/debug/apk -name '*.apk' | head -1)
           ${ANDROID_HOME}/build-tools/36.0.0/aapt2 dump badging "$APK" | grep -E "package:|sdkVersion|native-code"
 
       - uses: actions/upload-artifact@v4
         with:
           name: oc-gui-spike-apk
-          path: target/release/apk/**/*.apk
+          path: target/debug/apk/**/*.apk
