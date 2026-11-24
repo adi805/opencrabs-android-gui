@@ -20,7 +20,7 @@ log = "0.4"
 winit = "0.30"
 
 [package.metadata.android]
-package_name = "io.opencrabs.mobile.gui"
+package = "io.opencrabs.mobile.gui"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
