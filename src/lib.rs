@@ -103,7 +103,7 @@ impl eframe::App for Spike {
                     }
                 });
 
-                let focused = response.has_focus();
+                let focused = response.response.has_focus();
                 if focused && !self.kb_shown {
                     self.app.show_soft_input(true);
                     self.kb_shown = true;
