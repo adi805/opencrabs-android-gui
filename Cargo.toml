@@ -26,3 +26,10 @@ build_targets = ["aarch64-linux-android"]
 [package.metadata.android.sdk]
 min_sdk_version = 26
 target_sdk_version = 35
+
+# Release profile for the phone install: strip symbols so the APK fits a chat upload.
+[profile.release]
+opt-level = "s"
+lto = false
+codegen-units = 16
+strip = "symbols"
