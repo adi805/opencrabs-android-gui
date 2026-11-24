@@ -70,3 +70,92 @@ jobs:
         with:
           name: oc-gui-signed-apk
           path: out/
+
+  # Owner mandate: the agent tests the app itself on an emulator BEFORE the
+  # human ever installs anything. No tap-guessing: the app logs its own
+  # TextField center (PXCX/PXCY), CI taps exactly there, then asserts the
+  # keyboard is shown and typed text reached the field (TYPED chars>0).
+  emulator-test:
+    needs: apk
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/29.0.14206865
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDK components
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          sdkmanager --install "ndk;29.0.14206865" "build-tools;36.0.0" "platforms;android-35"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - name: Install cargo-apk (patched rev)
+        run: cargo install --git https://github.com/parasyte/cargo-apk.git --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
+
+      - name: Build x86_64 APK for the emulator
+        run: |
+          export PATH="${ANDROID_NDK_ROOT}:$PATH"
+          cargo apk build -p oc-gui --lib --target x86_64-linux-android
+          find target/debug/apk -name '*.apk' ! -name '*-unaligned.apk' -print -exec ls -l {} \;
+
+      - name: Boot emulator, install, tap field, type, assert
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: |
+            set -x
+            APK="$(find target/debug/apk -name '*.apk' ! -name '*-unaligned.apk' | head -1)"
+            adb install -r "$APK"
+            adb logcat -c
+            adb shell am start -W -n io.opencrabs.mobile.gui/android.app.NativeActivity
+
+            # Wait for the app to log its own TextField geometry.
+            LINE=""
+            for i in $(seq 1 30); do
+              LINE="$(adb logcat -d | grep -m1 'TEXTFIELD' || true)"
+              [ -n "$LINE" ] && break
+              sleep 2
+            done
+            echo "layout line: $LINE"
+            [ -n "$LINE" ] || { echo "FAIL: app never logged TEXTFIELD geometry"; exit 1; }
+
+            X="$(echo "$LINE" | grep -o 'PXCX=[0-9]*' | cut -d= -f2)"
+            Y="$(echo "$LINE" | grep -o 'PXCY=[0-9]*' | cut -d= -f2)"
+            [ -n "$X" ] && [ -n "$Y" ] || { echo "FAIL: could not parse tap coords from: $LINE"; exit 1; }
+            echo "tap target: $X,$Y"
+            adb shell input tap "$X" "$Y"
+            sleep 3
+
+            adb shell dumpsys input_method | grep -q 'mInputShown=true' \
+              || { echo "FAIL: soft keyboard not shown after tap+autofocus"; adb screencap -p /sdcard/fail-kb.png; adb pull /sdcard/fail-kb.png; exit 1; }
+            echo "PASS: keyboard shown"
+
+            adb logcat -c
+            adb shell input text "halo123"
+            sleep 3
+
+            TYPED="$(adb logcat -d | grep -o 'TYPED chars=[0-9]*' | tail -1)"
+            echo "typed line: $TYPED"
+            echo "$TYPED" | grep -qE 'TYPED chars=[1-9][0-9]*' \
+              || { echo "FAIL: typed text never reached the field (IME bridge broken)"; adb screencap -p /sdcard/fail-type.png; adb pull /sdcard/fail-type.png; exit 1; }
+            echo "PASS: typed text reached egui"
+
+            mkdir -p "$GITHUB_WORKSPACE/shots"
+            adb exec-out screencap -p > "$GITHUB_WORKSPACE/shots/after-type.png"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-evidence
+          path: |
+            shots/
+            fail-*.png
+          if-no-files-found: ignore
