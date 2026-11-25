@@ -105,9 +105,12 @@ $ADB install -r "$ADBKEYBOARD_APK" 2>&1 | tail -3 || fail "adb install ADBKeyboa
 
 # Run 45487962664 lesson: `ime enable` fired 2s after `install Success` and
 # failed with "Unknown input method" because the system had not finished
-# scanning the package yet (TCG emulator is heavily loaded; even `system`
-# showed an ANR during diagnostics). The IME must be polled in
-# `ime list -s` until it is REGISTERED, however long that takes.
+# scanning the package yet. At that time the emulator ran under forced TCG
+# (software emulation) because the runner user could not open /dev/kvm, so the
+# whole system was crawling and even `system` showed an ANR. KVM is now
+# enabled upstream (workflow step "Enable KVM access"), so the system is not
+# overloaded any more, but the IME must still be polled in `ime list -s`
+# until it is REGISTERED, however long that takes.
 say "waiting for ADBKeyboard to register: $IME_ID"
 IME_SEEN=0
 for _ in $(seq 1 60); do

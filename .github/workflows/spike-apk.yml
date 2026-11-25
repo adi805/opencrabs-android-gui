@@ -112,14 +112,24 @@ jobs:
             "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
-      # Diagnostics: ubuntu public runners are documented to have nested KVM.
-      # The earlier TCG error (run 45411777387) may have been caused by the
-      # forced-TCG env, not by a missing accelerator. Fail FAST with evidence
-      # if KVM is truly absent instead of a 30-min TCG crawl.
-      - name: Check KVM
+      # Run 45508916590 lesson: the emulator logged
+      #   ERROR | x86_64 emulation currently requires hardware acceleration!
+      #   CPU acceleration status: This user doesn't have permissions to use KVM
+      #   The KVM line in /etc/group is: [kvm:x:991:]
+      # /dev/kvm EXISTS on the ubuntu runner, but the group has no members, so
+      # user `runner` cannot open the node (mode 660 root:kvm). The emulator
+      # then exits instantly and adb never sees emulator-5554.
+      # Earlier "no KVM" verdicts were wrong: the TCG fallback came from the
+      # ANDROID_I_WANT_MY_TCG env we had forced ourselves.
+      - name: Enable KVM access (runner not in kvm group)
         run: |
-          ls -la /dev/kvm || true
-          grep -c -E 'vmx|svm' /proc/cpuinfo || echo 'no vmx/svm flags'
+          set -euxo pipefail
+          ls -la /dev/kvm
+          sudo groupadd -r kvm 2>/dev/null || true
+          sudo gpasswd -a "$(id -un)" kvm 2>/dev/null || true
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+          grep -cE 'vmx|svm' /proc/cpuinfo
       - name: Build .so (x86_64, for emulator)
         run: |
           cargo ndk -t x86_64 -o app/src/main/jniLibs build --lib
